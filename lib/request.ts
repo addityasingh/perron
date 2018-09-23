@@ -4,8 +4,12 @@ import {
   request as httpRequest
 } from "http";
 import { request as httpsRequest, RequestOptions } from "https";
+import { Socket } from "net";
 import * as querystring from "querystring";
 import * as zlib from "zlib";
+
+const READ_TIMEOUT = 2000;
+const CONNECTION_TIMEOUT = 1000;
 
 const getInterval = (time: [number, number]): number => {
   const diff = process.hrtime(time);
@@ -16,8 +20,8 @@ export interface ServiceClientRequestOptions extends RequestOptions {
   pathname: string;
   query?: object;
   timing?: boolean;
-  dropRequestAfter?: number;
   body?: any;
+  readTimeout?: number;
 }
 
 export class ServiceClientResponse {
@@ -94,10 +98,17 @@ export const request = (
     }
   }
 
+  // connection timeout - Happens when the socket connection cannot be established
+  const connectionTimeout = options.timeout || CONNECTION_TIMEOUT;
+  /**
+   * Read timeout - Happens after the socket connection is successfully established and
+   * when there is no activity on the connected socket.
+   */
+  const readTimeout = options.readTimeout || READ_TIMEOUT;
+
   const httpRequestFn =
     options.protocol === "https:" ? httpsRequest : httpRequest;
   return new Promise((resolve, originalReject) => {
-    let hasRequestEnded = false;
     let startTime: [number, number];
     let timings: Timings;
     let reject = originalReject;
@@ -119,89 +130,114 @@ export const request = (
         originalReject(errorWithTimings);
       };
     }
-    const requestObject = httpRequestFn(
-      options,
-      (response: IncomingMessage) => {
-        if (options.timing) {
-          if (timings.lookup === undefined) {
-            timings.lookup = timings.socket;
-          }
-          if (timings.connect === undefined) {
-            timings.connect = timings.socket;
-          }
-          timings.response = getInterval(startTime);
-        }
-        let bodyStream;
-        const chunks: Buffer[] = [];
-        const encoding =
-          response.headers && response.headers["content-encoding"];
-        if (encoding === "gzip" || encoding === "deflate") {
-          response.on("error", reject);
-          bodyStream = response.pipe(zlib.createUnzip());
-        } else {
-          bodyStream = response;
-        }
-        bodyStream.on("error", reject);
-        bodyStream.on("data", chunk => {
-          if (chunk instanceof Buffer) {
-            chunks.push(chunk);
-          } else {
-            chunks.push(Buffer.from(chunk, "utf-8"));
-          }
-        });
-        bodyStream.on("end", () => {
-          const body = Buffer.concat(chunks).toString("utf8");
-          hasRequestEnded = true;
-          const serviceClientResponse = new ServiceClientResponse(
-            response.statusCode || 0,
-            response.headers,
-            body,
-            options
-          );
-          if (options.timing) {
-            timings.end = getInterval(startTime);
-            serviceClientResponse.timings = timings;
-            serviceClientResponse.timingPhases = makeTimingPhases(timings);
-          }
-          resolve(serviceClientResponse);
-        });
-      }
-    );
-    if (options.timing) {
-      requestObject.once("socket", socket => {
+
+    const requestObject = httpRequestFn(options);
+
+    function setReadTimeout() {
+      requestObject.setTimeout(readTimeout, () => {
+        requestObject.socket.destroy();
+        reject(
+          new Error(
+            `Failed to read data within ${readTimeout} ms from ${options.host}`
+          )
+        );
+      });
+    }
+    // Fires once the socket is assigned to a request
+    requestObject.once("socket", (socket: Socket) => {
+      if (options.timing) {
         timings.socket = getInterval(startTime);
-        if (socket.connecting) {
-          const onLookUp = () => {
+      }
+      if (socket.connecting) {
+        socket.setTimeout(connectionTimeout, () => {
+          // socket should be manually cleaned up - can use .end() as well
+          socket.destroy();
+          reject(
+            new Error(
+              `Could not connect within ${connectionTimeout} ms to ${
+                options.host
+              }`
+            )
+          );
+        });
+        if (options.timing) {
+          socket.once("lookup", () => {
             timings.lookup = getInterval(startTime);
-          };
-          const onConnect = () => {
-            timings.connect = getInterval(startTime);
-          };
-          socket.once("lookup", onLookUp);
-          socket.once("connect", onConnect);
-          requestObject.once("error", () => {
-            socket.removeListener("lookup", onLookUp);
-            socket.removeListener("connect", onConnect);
           });
-        } else {
+        }
+        // connect event would kick in only for new socket connection and not for
+        // connections that are kept alive
+        socket.once("connect", () => {
+          if (options.timing) {
+            timings.connect = getInterval(startTime);
+          }
+          setReadTimeout();
+        });
+      } else {
+        if (options.timing) {
           timings.lookup = timings.socket;
           timings.connect = timings.socket;
         }
-      });
-    }
-    requestObject.on("error", reject);
-    requestObject.on("timeout", () => {
-      requestObject.abort();
-      reject(new Error("socket timeout"));
+        setReadTimeout();
+      }
     });
-    if (options.dropRequestAfter) {
-      setTimeout(() => {
-        if (!hasRequestEnded) {
-          requestObject.abort();
-          reject(new Error("request timeout"));
+
+    requestObject.on("response", (response: IncomingMessage) => {
+      if (options.timing) {
+        if (timings.lookup === undefined) {
+          timings.lookup = timings.socket;
         }
-      }, options.dropRequestAfter);
-    }
+        if (timings.connect === undefined) {
+          timings.connect = timings.socket;
+        }
+        timings.response = getInterval(startTime);
+      }
+
+      const { headers, statusCode } = response;
+      let bodyStream;
+
+      const encoding = headers && headers["content-encoding"];
+      if (encoding === "gzip" || encoding === "deflate") {
+        response.on("error", reject);
+        bodyStream = response.pipe(zlib.createUnzip());
+      } else {
+        bodyStream = response;
+      }
+
+      let chunks: Buffer[] = [];
+      let bufferLength = 0;
+
+      bodyStream.on("error", reject);
+
+      bodyStream.on("data", data => {
+        bufferLength += data.length;
+        chunks.push(data as Buffer);
+      });
+
+      bodyStream.on("end", () => {
+        const body = Buffer.concat(chunks, bufferLength).toString("utf8");
+
+        // to avoid leaky behavior
+        chunks = [];
+        bufferLength = 0;
+
+        const serviceClientResponse = new ServiceClientResponse(
+          statusCode || 0,
+          headers,
+          body,
+          options
+        );
+
+        if (options.timing) {
+          timings.end = getInterval(startTime);
+          serviceClientResponse.timings = timings;
+          serviceClientResponse.timingPhases = makeTimingPhases(timings);
+        }
+        resolve(serviceClientResponse);
+      });
+    });
+
+    requestObject.on("error", reject);
     if (options.body) {
       requestObject.write(options.body);
     }
