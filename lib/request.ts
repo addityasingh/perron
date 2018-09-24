@@ -8,8 +8,8 @@ import { Socket } from "net";
 import * as querystring from "querystring";
 import * as zlib from "zlib";
 
-const READ_TIMEOUT = 2000;
-const CONNECTION_TIMEOUT = 1000;
+const DEFAULT_READ_TIMEOUT = 2000;
+const DEFAULT_CONNECTION_TIMEOUT = 1000;
 
 const getInterval = (time: [number, number]): number => {
   const diff = process.hrtime(time);
@@ -99,12 +99,12 @@ export const request = (
   }
 
   // connection timeout - Happens when the socket connection cannot be established
-  const connectionTimeout = options.timeout || CONNECTION_TIMEOUT;
+  const connectionTimeout = options.timeout || DEFAULT_CONNECTION_TIMEOUT;
   /**
    * Read timeout - Happens after the socket connection is successfully established and
    * when there is no activity on the connected socket.
    */
-  const readTimeout = options.readTimeout || READ_TIMEOUT;
+  const readTimeout = options.readTimeout || DEFAULT_READ_TIMEOUT;
 
   const httpRequestFn =
     options.protocol === "https:" ? httpsRequest : httpRequest;
@@ -150,7 +150,7 @@ export const request = (
       }
       if (socket.connecting) {
         socket.setTimeout(connectionTimeout, () => {
-          // socket should be manually cleaned up - can use .end() as well
+          // socket should be manually cleaned up
           socket.destroy();
           reject(
             new Error(
