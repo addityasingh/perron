@@ -10,6 +10,10 @@ const stream = require("stream");
 class ResponseStub extends EventEmitter {}
 
 class RequestStub extends EventEmitter {
+  constructor() {
+    super();
+    this.setTimeout = sinon.stub();
+  }
   end() {}
 }
 
@@ -185,13 +189,15 @@ describe("request", () => {
   });
 
   it("should reject the promise on connection timeout", done => {
-    request({ timeout: 100, host: "example.com" })
+    const { timeout, host } = { timeout: 100, host: "b.com" };
+    request({ timeout, host })
       .catch(error => {
         assert.equal(
           error.message,
-          "Could not connect within 100 ms to example.com"
+          `Could not connect within ${timeout} ms to ${host}`
         );
         assert(socketStub.setTimeout.calledOnce);
+        sinon.assert.calledWith(socketStub.setTimeout.firstCall, timeout);
         assert(socketStub.destroy.calledOnce);
         done();
       })
@@ -202,34 +208,24 @@ describe("request", () => {
     socketStub.setTimeout.invokeCallback();
   });
 
-  it.skip("should resolve the promise when response finishes in time", done => {
-    requestStub.abort = sinon.stub();
-    const responseStub = new ResponseStub();
-    request({ dropRequestAfter: 500 }).then(response => {
-      assert.equal(response.body, "hello");
-      assert(!requestStub.abort.called);
-      done();
-    }, done);
-    clock.tick(100);
-    requestStub.emit("response", responseStub);
-    clock.tick(100);
-    responseStub.emit("data", Buffer.from("hello"));
-    clock.tick(100);
-    responseStub.emit("end");
-  });
-
-  it.skip("should resolve the promise when response finishes in time without data", done => {
-    requestStub.abort = sinon.stub();
-    const responseStub = new ResponseStub();
-    request({ dropRequestAfter: 500 }).then(response => {
-      assert.equal(response.body, "");
-      assert(!requestStub.abort.called);
-      done();
-    }, done);
-    clock.tick(100);
-    requestStub.emit("response", responseStub);
-    clock.tick(100);
-    responseStub.emit("end");
+  it("should reject the promise on read timeout", done => {
+    const { readTimeout, host } = { readTimeout: 200, host: "a.com" };
+    request({ readTimeout, host })
+      .catch(error => {
+        assert.equal(
+          error.message,
+          `Failed to read data within ${readTimeout} ms from ${host}`
+        );
+        sinon.assert.calledWith(requestStub.setTimeout.firstCall, readTimeout);
+        assert(requestStub.setTimeout.calledOnce);
+        assert(requestStub.socket.destroy.calledOnce);
+        done();
+      })
+      .catch(done);
+    const socketStub = new SocketStub(false);
+    requestStub.socket = socketStub;
+    requestStub.emit("socket", socketStub);
+    requestStub.setTimeout.invokeCallback();
   });
 
   it("should attach the request options to the response", done => {
@@ -249,38 +245,7 @@ describe("request", () => {
     responseStub.emit("end");
   });
 
-  it.skip("should reject the promise when response arrives but does not finish in time", done => {
-    requestStub.abort = sinon.stub();
-    const responseStub = new ResponseStub();
-    responseStub.destroy = sinon.stub();
-    request({ dropRequestAfter: 500 })
-      .catch(error => {
-        assert.equal(error.message, "request timeout");
-        assert(requestStub.abort.called);
-        done();
-      })
-      .catch(done);
-    clock.tick(100);
-    requestStub.emit("response", responseStub);
-    clock.tick(100);
-    responseStub.emit("data", "hello");
-    clock.tick(300);
-  });
-
-  it.skip("should reject the promise when response does not arrive in time", done => {
-    requestStub.abort = sinon.stub();
-    httpsStub.request.returns(requestStub);
-    request({ dropRequestAfter: 500 })
-      .catch(error => {
-        assert.equal(error.message, "request timeout");
-        assert(requestStub.abort.calledOnce);
-        done();
-      })
-      .catch(done);
-    clock.tick(500);
-  });
-
-  it.skip("should record timings for non-keep-alive connection", done => {
+  it("should record timings for non-keep-alive connection", done => {
     request({ timing: true }).then(response => {
       assert.deepEqual(response.timings, {
         socket: 10,
@@ -314,7 +279,7 @@ describe("request", () => {
     responseStub.emit("end");
   });
 
-  it.skip("should record timings for keep-alive connection", done => {
+  it("should record timings for keep-alive connection", done => {
     request({ timing: true }).then(response => {
       assert.deepEqual(response.timings, {
         socket: 10,
@@ -344,14 +309,14 @@ describe("request", () => {
     responseStub.emit("end");
   });
 
-  it.skip("should record timings for timeout", done => {
-    requestStub.abort = sinon.stub();
+  it("should record timings for timeout", done => {
     const responseStub = new ResponseStub();
-    responseStub.destroy = sinon.stub();
-    request({ timing: true, dropRequestAfter: 500 })
+    request({ timing: true, readTimeout: 500, host: "c.com" })
       .catch(error => {
-        assert.equal(error.message, "request timeout");
-        assert(requestStub.abort.called);
+        assert.equal(
+          error.message,
+          "Failed to read data within 500 ms from c.com"
+        );
         assert.deepEqual(error.timings, {
           lookup: 10,
           socket: 10,
@@ -371,6 +336,7 @@ describe("request", () => {
       })
       .catch(done);
     const socketStub = new SocketStub(false);
+    requestStub.socket = socketStub;
     clock.tick(10);
     requestStub.emit("socket", socketStub);
     clock.tick(90);
@@ -378,5 +344,6 @@ describe("request", () => {
     clock.tick(100);
     responseStub.emit("data", "hello");
     clock.tick(300);
+    requestStub.setTimeout.invokeCallback();
   });
 });
